@@ -1,0 +1,28 @@
+# ── Environnement ─────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+pip-log.txt
+
+# ── Base de données ────────────────────────────────────────────────
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# ── macOS ──────────────────────────────────────────────────────────
+.DS_Store
