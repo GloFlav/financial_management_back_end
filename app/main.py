@@ -1,13 +1,18 @@
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from sqlalchemy import text
 
 from app.database import Base, engine
 from app.models import wallet, transaction  # noqa: F401 — enregistre les modèles
 from app.models import fixed_charge, provisional_expense  # noqa: F401
 from app.models import user_settings as _user_settings_model  # noqa: F401
+from app.models import category_budget as _category_budget_model  # noqa: F401
 from app.routers.finance import router as finance_router
 from app.seed import seed
+from app.ws_manager import manager
 
 Base.metadata.create_all(bind=engine)
 
@@ -42,17 +47,53 @@ except Exception:
 
 seed()
 
+# Seed budget par défaut : alimentation = 400 000 Ar
+try:
+    from app.database import SessionLocal as _SL2
+    from app.models.category_budget import CategoryBudget as _CB
+    _db2 = _SL2()
+    if not _db2.query(_CB).filter(_CB.category == "alimentation").first():
+        _db2.add(_CB(category="alimentation", default_amount=400_000))
+        _db2.commit()
+    _db2.close()
+except Exception:
+    pass
+
 app = FastAPI(title="Financial Management API", version="0.1.0")
+
+
+class BroadcastMiddleware(BaseHTTPMiddleware):
+    """Diffuse un refresh WebSocket après chaque mutation réussie."""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if request.method in ("POST", "PATCH", "DELETE", "PUT") and response.status_code < 300:
+            await manager.broadcast({"type": "refresh"})
+        return response
+
+
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3001,http://localhost:5173").split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3001", "http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(BroadcastMiddleware)
 
 app.include_router(finance_router)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()   # keep-alive — on ignore le contenu
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+
 
 @app.get("/health")
 def health():

@@ -6,7 +6,7 @@ import time
 import httpx
 import calendar
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, timezone
@@ -27,6 +27,8 @@ from app.schemas.wallet import WalletOut, WalletCreate
 from app.schemas.transaction import TransactionCreate, TransactionOut
 from app.schemas.fixed_charge import FixedChargeCreate, FixedChargeOut
 from app.schemas.provisional_expense import ProvisionalExpenseCreate, ProvisionalExpenseOut
+from app.schemas.category_budget import CategoryBudgetCreate, CategoryBudgetPatch, CategoryBudgetOut
+from app.models.category_budget import CategoryBudget
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
@@ -107,7 +109,20 @@ def get_summary(db: Session = Depends(get_db)):
         ProvisionalExpense.month == this_month_str
     ).scalar() or 0
 
-    budget_libre = monthly_salary - effective_savings - total_fixed - prov_this_month
+    cat_budgets = db.query(CategoryBudget).all()
+    total_cat_budgets = sum(
+        (cb.override_amount if (cb.override_month == this_month_int and cb.override_amount) else cb.default_amount)
+        for cb in cat_budgets
+    )
+    cat_budget_items = [
+        {
+            "category": cb.category,
+            "amount": cb.override_amount if (cb.override_month == this_month_int and cb.override_amount) else cb.default_amount,
+        }
+        for cb in cat_budgets
+    ]
+
+    budget_libre = monthly_salary - effective_savings - total_fixed - prov_this_month - total_cat_budgets
 
     return {
         "balance": total_balance,
@@ -122,7 +137,9 @@ def get_summary(db: Session = Depends(get_db)):
             "savings":           effective_savings,
             "savings_is_exc":    exc_month_int == this_month_int and exc_amount > 0,
             "fixed_charges":     total_fixed,
-            "provisionals":      prov_this_month,
+            "provisionals":      int(prov_this_month),
+            "category_budgets":  total_cat_budgets,
+            "category_budget_items": cat_budget_items,
             "libre":             budget_libre,
         },
         "wallets": [
@@ -165,6 +182,93 @@ def get_transactions(
         out.wallet_name = tx.wallet.name if tx.wallet else ""
         result.append(out)
     return result
+
+
+@router.get("/transactions/export")
+def export_transactions_csv(db: Session = Depends(get_db)):
+    txs = db.query(Transaction).order_by(Transaction.date.desc()).limit(1000).all()
+    rows = ["\uFEFFDate,Type,Catégorie,Description,Montant (Ar),Portefeuille"]
+    for tx in txs:
+        wallet_name = tx.wallet.name if tx.wallet else ""
+        sign = tx.amount if tx.type == "income" else -tx.amount
+        desc = (tx.description or "").replace(",", " ")
+        date_str = tx.date.strftime("%d/%m/%Y")
+        rows.append(f"{date_str},{tx.type},{tx.category},{desc},{sign},{wallet_name}")
+    csv_content = "\n".join(rows)
+    filename = f"transactions_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@router.get("/transactions/export/pdf")
+def export_transactions_pdf(db: Session = Depends(get_db)):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+
+    txs = db.query(Transaction).order_by(Transaction.date.desc()).limit(1000).all()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+        leftMargin=15*mm, rightMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('title', parent=styles['Heading1'],
+        fontSize=14, textColor=colors.HexColor('#1a1a2e'), spaceAfter=4)
+    sub_style = ParagraphStyle('sub', parent=styles['Normal'],
+        fontSize=9, textColor=colors.grey, spaceAfter=10)
+
+    elems = [
+        Paragraph("Transactions financières", title_style),
+        Paragraph(f"Exporté le {datetime.now().strftime('%d/%m/%Y à %H:%M')} — {len(txs)} transactions", sub_style),
+        Spacer(1, 4*mm),
+    ]
+
+    header = ["Date", "Type", "Catégorie", "Description", "Montant (Ar)", "Portefeuille"]
+    data_rows = [header]
+    for tx in txs:
+        wallet_name = tx.wallet.name if tx.wallet else ""
+        sign = f"+{tx.amount:,}" if tx.type == "income" else f"-{tx.amount:,}"
+        desc = (tx.description or "")[:30]
+        data_rows.append([
+            tx.date.strftime("%d/%m/%Y"), tx.type, tx.category, desc, sign, wallet_name
+        ])
+
+    col_widths = [22*mm, 18*mm, 28*mm, 50*mm, 30*mm, 32*mm]
+    tbl = Table(data_rows, colWidths=col_widths, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ('BACKGROUND',  (0,0), (-1,0), colors.HexColor('#1a1a2e')),
+        ('TEXTCOLOR',   (0,0), (-1,0), colors.white),
+        ('FONTSIZE',    (0,0), (-1,0), 8),
+        ('FONTSIZE',    (0,1), (-1,-1), 7.5),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f5f5f8')]),
+        ('TEXTCOLOR',   (4,1), (4,-1), colors.HexColor('#c0392b')),
+        ('GRID',        (0,0), (-1,-1), 0.3, colors.HexColor('#dddddd')),
+        ('ALIGN',       (4,0), (4,-1), 'RIGHT'),
+        ('TOPPADDING',  (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING',(0,0), (-1,-1), 3),
+        ('LEFTPADDING', (0,0), (-1,-1), 4),
+    ]))
+    # Colorer les revenus en vert
+    for i, tx in enumerate(txs, start=1):
+        if tx.type == "income":
+            tbl.setStyle(TableStyle([('TEXTCOLOR', (4,i), (4,i), colors.HexColor('#27ae60'))]))
+
+    elems.append(tbl)
+    doc.build(elems)
+    buf.seek(0)
+
+    filename = f"transactions_{datetime.now().strftime('%Y-%m-%d')}.pdf"
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 @router.post("/transactions", response_model=TransactionOut)
@@ -233,11 +337,23 @@ def add_transaction(data: TransactionCreate, db: Session = Depends(get_db)):
 # ─── Stats journalières du mois en cours ─────────────────────────
 @router.get("/daily-stats")
 def daily_stats(db: Session = Depends(get_db)):
-    import datetime as dt
+    import calendar
     from collections import defaultdict
 
     now = datetime.now(timezone.utc)
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    today = now.day
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+
+    # ── Soldes wallets ───────────────────────────────────────────────
+    settings_now    = _get_settings(db)
+    wallets_total   = sum(w.balance for w in db.query(Wallet).all())
+    savings_wallet_id = settings_now.get("savings_wallet_id", 0)
+    if savings_wallet_id:
+        sw = db.query(Wallet).filter(Wallet.id == savings_wallet_id).first()
+        savings_balance = sw.balance if sw else 0
+    else:
+        savings_balance = settings_now.get("current_savings_balance", 0)
 
     txs = db.query(Transaction).filter(
         Transaction.date >= start, Transaction.date <= now
@@ -252,14 +368,136 @@ def daily_stats(db: Session = Depends(get_db)):
         elif tx.type == "expense":
             daily_exp[k] += tx.amount
 
+    # Solde initial du mois = solde actuel - revenus du mois + dépenses du mois
+    total_inc_month = sum(daily_inc.values())
+    total_exp_month = sum(daily_exp.values())
+    balance_start   = wallets_total - total_inc_month + total_exp_month
+
     days = []
     cum_inc = cum_exp = 0
-    for d in range(1, now.day + 1):
-        cum_inc += daily_inc.get(d, 0)
-        cum_exp += daily_exp.get(d, 0)
-        days.append({ "day": d, "cum_income": cum_inc, "cum_expenses": cum_exp })
+    for d in range(1, today + 1):
+        inc_d = daily_inc.get(d, 0)
+        exp_d = daily_exp.get(d, 0)
+        cum_inc += inc_d
+        cum_exp += exp_d
+        days.append({
+            "day":          d,
+            "cum_income":   cum_inc,
+            "cum_expenses": cum_exp,
+            "balance":      balance_start + cum_inc - cum_exp,
+            "daily_exp":    exp_d,
+            "daily_inc":    inc_d,
+        })
 
-    return { "days": days, "total_days": now.day }
+    # ── Projection ──────────────────────────────────────────────────
+    settings     = _get_settings(db)
+    salary_amt   = settings.get("monthly_salary", 2_500_000)
+    this_month_str = now.strftime("%Y-%m")
+
+    # Taux moyen de dépense par jour (hors jours sans données)
+    active_days = sum(1 for d in range(1, today + 1) if daily_exp.get(d, 0) > 0 or daily_inc.get(d, 0) > 0)
+    daily_rate  = cum_exp / max(active_days, 1)
+
+    # ── Salaire attendu ? ──────────────────────────────────────────
+    salary_received = db.query(Transaction).filter(
+        Transaction.type == "income",
+        Transaction.category == "salaire",
+        Transaction.date >= start,
+    ).first() is not None
+
+    if not salary_received:
+        # Paie vers le 10, au plus tard le 15
+        salary_day = 10 if today < 10 else (15 if today < 15 else None)
+    else:
+        salary_day = None
+
+    # ── Charges fixes non encore payées ce mois ──────────────────
+    # Séquence temporelle : salaire d'abord → charges fixes → prévisionnelles
+    charges = db.query(FixedCharge).filter(FixedCharge.active == True).all()
+    fixed_by_day: dict = defaultdict(int)
+    # Jour de référence pour planifier les charges en retard :
+    # si salaire pas encore reçu → après le jour de paie ; sinon → demain
+    overdue_target = min((salary_day + 1) if (not salary_received and salary_day) else today + 1,
+                         days_in_month)
+    for c in charges:
+        marker = f"[Auto] {c.name}"
+        already = db.query(Transaction).filter(
+            Transaction.description == marker,
+            Transaction.date >= start,
+            Transaction.wallet_id == c.wallet_id,
+        ).first()
+        if not already:
+            if c.day_of_month > today:
+                # Charge future : si elle tombe avant le salaire, la décaler après
+                sched = c.day_of_month if (salary_received or not salary_day or c.day_of_month > salary_day) \
+                        else salary_day + 1
+            else:
+                # Charge en retard → après salaire
+                sched = overdue_target
+            fixed_by_day[min(sched, days_in_month)] += c.amount
+
+    # ── Dépenses prévisionnelles : étalées APRÈS les charges fixes ──
+    prov_total = int(db.query(func.sum(ProvisionalExpense.amount)).filter(
+        ProvisionalExpense.month == this_month_str
+    ).scalar() or 0)
+    # Les prévisionnelles commencent après le jour des charges (overdue_target + 1)
+    prov_start = min(overdue_target + 1, days_in_month)
+    remaining_prov_days = days_in_month - prov_start + 1
+    prov_daily = prov_total / max(remaining_prov_days, 1)
+
+    # ── Construction de la projection jour par jour ────────────────
+    proj_exp_cum = cum_exp
+    proj_inc_cum = cum_inc
+    projection = []
+    for d in range(today + 1, days_in_month + 1):
+        fixed_d  = fixed_by_day.get(d, 0)
+        salary_d = salary_amt if (salary_day and d == salary_day) else 0
+        prov_d   = prov_daily if d >= prov_start else 0
+
+        proj_exp_d    = daily_rate + fixed_d + prov_d
+        proj_exp_cum += proj_exp_d
+        proj_inc_cum += salary_d
+
+        proj_balance = wallets_total + (proj_inc_cum - cum_inc) - (proj_exp_cum - cum_exp)
+
+        projection.append({
+            "day":           d,
+            "proj_expenses": round(proj_exp_cum),
+            "proj_income":   round(proj_inc_cum),
+            "balance":       round(proj_balance),
+            "daily_exp":     round(proj_exp_d),
+            "daily_inc":     round(salary_d),
+        })
+
+    future_income  = proj_inc_cum - cum_inc
+    future_expense = proj_exp_cum - cum_exp
+    projected_end_balance = wallets_total + future_income - future_expense
+
+    total_pending_fixed   = sum(fixed_by_day.values())
+    projected_daily_spend = round(daily_rate * (days_in_month - today))
+    breakdown = {
+        "current_balance": wallets_total,
+        "salary_incoming": round(future_income),
+        "daily_spend":     projected_daily_spend,
+        "fixed_charges":   total_pending_fixed,
+        "provisionals":    prov_total,
+    }
+
+    return {
+        "days":                  days,
+        "today":                 today,
+        "days_in_month":         days_in_month,
+        "daily_rate":            round(daily_rate),
+        "cum_income":            cum_inc,
+        "cum_expenses":          cum_exp,
+        "salary_day":            salary_day,
+        "salary_received":       salary_received,
+        "projection":            projection,
+        "projected_end_balance": round(projected_end_balance),
+        "breakdown":             breakdown,
+        "balance_today":         wallets_total,
+        "savings_balance":       savings_balance,
+    }
 
 
 # ─── Budget période salariale (15→15) ────────────────────────────
@@ -378,6 +616,7 @@ class TransferRequest(BaseModel):
     from_wallet_id: int
     to_wallet_id:   int
     amount:         int
+    fee:            Optional[int] = 0
     description:    Optional[str] = None
 
 @router.post("/transfer")
@@ -388,19 +627,25 @@ def transfer_between_wallets(data: TransferRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="Wallet source introuvable")
     if not dst:
         raise HTTPException(status_code=404, detail="Wallet destination introuvable")
-    if src.balance < data.amount:
-        raise HTTPException(status_code=400, detail="Solde insuffisant")
+    fee = data.fee or 0
+    total_deducted = data.amount + fee
+    if src.balance < total_deducted:
+        raise HTTPException(status_code=400, detail="Solde insuffisant (montant + frais)")
 
     desc = data.description or f"Transfert → {dst.name}"
-    src.balance -= data.amount
+    src.balance -= total_deducted
     dst.balance += data.amount
 
+    now = datetime.now(timezone.utc)
     db.add(Transaction(type="expense", amount=data.amount, category="transfert",
-        description=desc, wallet_id=src.id, date=datetime.now(timezone.utc)))
+        description=desc, wallet_id=src.id, date=now))
     db.add(Transaction(type="income", amount=data.amount, category="transfert",
-        description=desc, wallet_id=dst.id, date=datetime.now(timezone.utc)))
+        description=desc, wallet_id=dst.id, date=now))
+    if fee > 0:
+        db.add(Transaction(type="expense", amount=fee, category="transfert",
+            description=f"Frais transfert → {dst.name}", wallet_id=src.id, date=now))
     db.commit()
-    return {"ok": True, "from": src.name, "to": dst.name, "amount": data.amount}
+    return {"ok": True, "from": src.name, "to": dst.name, "amount": data.amount, "fee": fee}
 
 
 # ─── Charges fixes ────────────────────────────────────────────────
@@ -515,6 +760,101 @@ def delete_provisional_expense(item_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+# ─── Budgets par catégorie ────────────────────────────────────────
+
+@router.get("/category-budgets", response_model=List[CategoryBudgetOut])
+def get_category_budgets(db: Session = Depends(get_db)):
+    budgets = db.query(CategoryBudget).order_by(CategoryBudget.category).all()
+    now = datetime.now(timezone.utc)
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    current_yyyymm = int(now.strftime("%Y%m"))
+    result = []
+    for b in budgets:
+        effective = (
+            b.override_amount
+            if b.override_month == current_yyyymm and b.override_amount
+            else b.default_amount
+        )
+        spent = db.query(func.sum(Transaction.amount)).filter(
+            Transaction.type == "expense",
+            Transaction.category == b.category,
+            Transaction.date >= start_of_month,
+        ).scalar() or 0
+        result.append(CategoryBudgetOut(
+            category=b.category,
+            default_amount=b.default_amount,
+            override_amount=b.override_amount,
+            override_month=b.override_month,
+            effective_limit=effective,
+            spent=spent,
+            ratio=round(spent / effective, 3) if effective > 0 else 0.0,
+        ))
+    return result
+
+
+@router.post("/category-budgets", response_model=CategoryBudgetOut)
+def create_category_budget(data: CategoryBudgetCreate, db: Session = Depends(get_db)):
+    existing = db.query(CategoryBudget).filter(CategoryBudget.category == data.category).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Budget déjà défini pour cette catégorie")
+    b = CategoryBudget(category=data.category, default_amount=data.default_amount)
+    db.add(b)
+    db.commit()
+    db.refresh(b)
+    return CategoryBudgetOut(
+        category=b.category, default_amount=b.default_amount,
+        override_amount=None, override_month=None,
+        effective_limit=b.default_amount, spent=0, ratio=0.0,
+    )
+
+
+@router.patch("/category-budgets/{category}", response_model=CategoryBudgetOut)
+def patch_category_budget(category: str, data: CategoryBudgetPatch, db: Session = Depends(get_db)):
+    b = db.query(CategoryBudget).filter(CategoryBudget.category == category).first()
+    if not b:
+        raise HTTPException(status_code=404, detail="Budget introuvable")
+    if data.default_amount is not None:
+        b.default_amount = data.default_amount
+    if data.override_amount is not None:
+        if data.override_amount > 0:
+            b.override_amount = data.override_amount
+            b.override_month  = data.override_month
+        else:
+            b.override_amount = None
+            b.override_month  = None
+    db.commit()
+    db.refresh(b)
+    now = datetime.now(timezone.utc)
+    current_yyyymm = int(now.strftime("%Y%m"))
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    effective = (
+        b.override_amount
+        if b.override_month == current_yyyymm and b.override_amount
+        else b.default_amount
+    )
+    spent = db.query(func.sum(Transaction.amount)).filter(
+        Transaction.type == "expense",
+        Transaction.category == b.category,
+        Transaction.date >= start_of_month,
+    ).scalar() or 0
+    return CategoryBudgetOut(
+        category=b.category, default_amount=b.default_amount,
+        override_amount=b.override_amount, override_month=b.override_month,
+        effective_limit=effective, spent=spent,
+        ratio=round(spent / effective, 3) if effective > 0 else 0.0,
+    )
+
+
+@router.delete("/category-budgets/{category}")
+def delete_category_budget(category: str, db: Session = Depends(get_db)):
+    b = db.query(CategoryBudget).filter(CategoryBudget.category == category).first()
+    if not b:
+        raise HTTPException(status_code=404, detail="Budget introuvable")
+    db.delete(b)
+    db.commit()
+    return {"ok": True}
+
+
 # ─── Auto-apply charges fixes ─────────────────────────────────────
 @router.get("/apply-fixed-charges")
 def apply_fixed_charges(db: Session = Depends(get_db)):
@@ -625,6 +965,15 @@ def chat(data: ChatRequest, db: Session = Depends(get_db)):
     )
     prov_context = f"\nDépenses prévisionnelles à venir :\n{prov_lines}" if prov_lines else "\nDépenses prévisionnelles : aucune"
 
+    # Budgets par catégorie (pour matching alimentation, etc.)
+    cat_budgets = db.query(CategoryBudget).all()
+    now_yyyymm = int(now_ctx.strftime("%Y%m"))
+    cat_budget_lines = "\n".join(
+        f'- {b.category} : plafond {(b.override_amount if b.override_month == now_yyyymm and b.override_amount else b.default_amount):,} Ar/mois'
+        for b in cat_budgets
+    )
+    cat_context = f"\nBudgets catégorie (dépenses suivies automatiquement par catégorie) :\n{cat_budget_lines}" if cat_budget_lines else ""
+
     # Profil utilisateur + budget réel
     settings = _get_settings(db)
     monthly_salary       = settings.get("monthly_salary", 2_500_000)
@@ -651,13 +1000,23 @@ def chat(data: ChatRequest, db: Session = Depends(get_db)):
         if exceptional_active else ""
     )
 
-    system_prompt = f"""Tu es Zoky, gestionnaire de compte personnel expert. Tu parles à un utilisateur malgache qui gère ses finances en Ariary (Ar).
+    system_prompt = f"""Tu es Zoky kiontabla, gestionnaire de compte personnel expert. Tu parles à un utilisateur malgache qui gère ses finances en Ariary (Ar).
 
 Ton style : direct, chiffré, sans langue de bois. Comme un CFO ami qui dit la vérité.
 Tes réponses doivent avoir de la personnalité — pas de réponses plates et génériques.
 Utilise \\n\\n entre les paragraphes pour aérer. Donne des chiffres précis, des ratios, des recommandations fermes.
 Pour les questions de budget/achat : calcule immédiatement (épargne nécessaire, délai, ratio dépenses/revenus).
 Pour les conseils : sois spécifique, pas "économise davantage" mais "réduis alimentation de 20% = +X Ar/mois".
+
+RÈGLES DE WALLET — PRIORITÉ ABSOLUE (appliquer AVANT toute autre inférence) :
+1. WALLET PAR DÉFAUT : si l'utilisateur ne précise pas de wallet, toujours utiliser "Argent liquide".
+   Exemples : "j'ai dépensé 5000", "achat de riz 3000", "taxi 2000" → wallet = Argent liquide.
+2. CRÉDIT YAS / OPÉRATEUR YAS : "crédit Yas", "recharge Yas", "forfait Yas" → wallet = "Mvola" par défaut.
+   SAUF si l'utilisateur précise une autre origine (ex: "en liquide", "cash", "avec mon compte") → utiliser le wallet précisé.
+3. CONNEXION ORANGE / INTERNET ORANGE : "paiement connexion Orange", "internet Orange", "forfait Orange", "pass Internet Orange" → wallet = "Orange Money".
+4. TRANSFERTS CASH / MOBILE MONEY → LIQUIDE : "j'ai retiré de l'Orange Money", "retrait Mvola", "transfert banque en liquide"
+   → utiliser l'action "transfer" avec to_wallet = "Argent liquide".
+5. FRAIS MVOLA : les frais de retrait ou de service Mvola → expense depuis "Mvola", catégorie "mvola".
 
 PROFIL FINANCIER (RÈGLES ABSOLUES — NE JAMAIS DÉROGER) :
 Salaire : {fmt_n(monthly_salary)} Ar/mois
@@ -676,6 +1035,7 @@ DONNÉES FINANCIÈRES ACTUELLES :{savings_wallet_line}
 {wallet_list}
 {fixed_context}
 {prov_context}
+{cat_context}
 {tx_context}
 
 Réponds UNIQUEMENT avec un JSON valide (sans markdown) :
@@ -689,15 +1049,31 @@ Réponds UNIQUEMENT avec un JSON valide (sans markdown) :
 RÈGLES D'ACTION — CHOISIS LA BONNE :
 
 ▶ transfer → virement entre deux wallets (épargne, transfert, remboursement interne)
-  Ex: "vire 1M vers mon épargne", "j'ai épargné 1.000.000 ce mois", "transfert de 500k de MVola vers Banque"
-  data = {{ "from_wallet_id": int, "to_wallet_id": int, "amount": int, "description": str }}
+  Ex: "vire 1M vers mon épargne", "j'ai épargné 1.000.000 ce mois", "transfert de 500k de MVola vers Banque", "j'ai transféré 20k de Mvola vers banque avec 500 de frais"
+  data = {{ "from_wallet_id": int, "to_wallet_id": int, "amount": int, "fee": int (0 si non précisé), "description": str }}
   requires_confirmation = true si wallet source ou montant incertains, sinon false
 
 ▶ add_transaction → dépense ou revenu DÉJÀ effectué (passé ou présent immédiat)
   Ex: "j'ai dépensé 5000", "j'ai reçu ma paie", "achat de ce matin"
-  data = {{ "type": "income"|"expense", "amount": int, "category": str, "wallet_id": int, "description": str }}
+  data = {{ "type": "income"|"expense", "amount": int, "category": str, "wallet_id": int, "description": str,
+            "provisional_id": int|null, "fixed_charge_id": int|null }}
   Catégories : alimentation, transport, salaire, transfert, loyer, santé, loisirs, mvola, orange_money, internet, autre
   requires_confirmation = false si montant ET portefeuille clairs
+
+  RÈGLES DE MATCHING AUTOMATIQUE (PRIORITÉ HAUTE) :
+  • Si la dépense correspond à une dépense prévisionnelle connue (même description, même personne, même objet)
+    → mettre provisional_id = <id de la provision> + utiliser wallet_id et category de la provision
+    → cela marquera la provision comme réalisée (elle sera supprimée)
+    Ex: provision "Mika 50k" → utilisateur dit "j'ai donné l'argent à Mika" → provisional_id = <id>
+
+  • Si la dépense correspond à une charge fixe connue (loyer, connexion Orange, Yas, lessive…)
+    → mettre fixed_charge_id = <id de la charge> + utiliser son wallet_id
+    → cela marquera la charge comme payée ce mois
+    Ex: "j'ai payé le loyer" → fixed_charge_id = <id du loyer>
+
+  • Si la catégorie correspond à un budget catégorie (alimentation, transport…)
+    → simplement mettre la bonne category (le suivi du budget est automatique)
+    Ex: "achat de riz 30k" → category = "alimentation" (déduit du budget alimentation)
 
 ▶ add_multiple_transactions → plusieurs transactions passées d'un coup
   data = {{ "transactions": [...] }}
@@ -776,6 +1152,22 @@ Commence directement par {{ et termine par }}. Aucun markdown, aucune explicatio
                         wallet_id=d["wallet_id"], date=datetime.now(timezone.utc),
                     )
                     db.add(tx)
+                    db.flush()  # get tx.id before commit
+
+                    # Auto-match: provisional expense fulfilled → delete it
+                    prov_id = d.get("provisional_id")
+                    if prov_id:
+                        prov = db.query(ProvisionalExpense).filter(ProvisionalExpense.id == prov_id).first()
+                        if prov:
+                            db.delete(prov)
+
+                    # Auto-match: fixed charge paid → mark description
+                    fc_id = d.get("fixed_charge_id")
+                    if fc_id:
+                        charge = db.query(FixedCharge).filter(FixedCharge.id == fc_id).first()
+                        if charge:
+                            tx.description = f"[Auto] {charge.name}"
+
                     db.commit()
             elif action == "create_wallet" and d:
                 w = Wallet(name=d["name"], type=d.get("type", "autre"), balance=d.get("balance", 0))
@@ -1254,6 +1646,37 @@ class VoiceRequest(BaseModel):
     text: str
 
 
+@router.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Transcrit un fichier audio via Whisper (OpenAI). Retourne {"text": "..."}"""
+    keys = []
+    for k in ("OPENAI_API_KEY_1", "OPENAI_API_KEY_2", "OPENAI_API_KEY"):
+        v = os.getenv(k, "").strip()
+        if v and v not in keys:
+            keys.append(v)
+    if not keys:
+        raise HTTPException(status_code=503, detail="Pas de clé OpenAI configurée")
+
+    audio_bytes = await file.read()
+    filename = file.filename or "audio.m4a"
+
+    for key in keys:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    data={"model": "whisper-1", "language": "fr"},
+                    files={"file": (filename, audio_bytes, file.content_type or "audio/m4a")},
+                )
+            if r.status_code == 200:
+                return {"text": r.json().get("text", "").strip()}
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=500, detail="Transcription Whisper échouée")
+
+
 @router.post("/voice")
 def parse_voice(data: VoiceRequest, db: Session = Depends(get_db)):
     """Reçoit du texte (STT) et utilise un LLM pour extraire les infos de transaction."""
@@ -1269,6 +1692,12 @@ Analyse ce texte vocal et extrais les informations de transaction.
 Portefeuilles disponibles :
 {wallet_list}
 
+RÈGLES DE WALLET (priorité absolue) :
+- Si aucun wallet mentionné → utiliser "Argent liquide" (wallet par défaut)
+- "crédit Yas", "recharge Yas", "forfait Yas" → wallet = "Mvola" par défaut, SAUF si l'utilisateur précise l'origine (ex: "en liquide", "cash" → Argent liquide)
+- "connexion Orange", "internet Orange", "forfait Orange" → wallet = "Orange Money"
+- "retrait Mvola", "retrait Orange Money" → ce sont des transferts (transfer), pas des expenses
+
 Texte vocal : "{data.text}"
 
 Réponds UNIQUEMENT avec un objet JSON valide (sans markdown) avec ces champs :
@@ -1282,7 +1711,10 @@ Réponds UNIQUEMENT avec un objet JSON valide (sans markdown) avec ces champs :
 Exemples d'interprétation :
 - "j'ai reçu mon salaire sur mon compte" → type=income, category=salaire, wallet=compte bancaire
 - "j'ai fait un achat depuis mvola de 10000" → type=expense, category=transfert, wallet=Mvola, amount=10000
-- "j'ai dépensé 5000 en nourriture" → type=expense, category=alimentation"""
+- "j'ai dépensé 5000 en nourriture" → type=expense, category=alimentation, wallet=Argent liquide
+- "j'ai acheté un crédit Yas de 3000" → type=expense, category=internet, wallet=Mvola
+- "j'ai acheté un crédit Yas de 3000 en liquide" → type=expense, category=internet, wallet=Argent liquide
+- "j'ai payé ma connexion Orange" → type=expense, category=internet, wallet=Orange Money"""
 
     try:
         parsed = call_llm_json(
