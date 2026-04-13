@@ -271,6 +271,50 @@ def export_transactions_pdf(db: Session = Depends(get_db)):
     )
 
 
+class TransactionPatch(BaseModel):
+    wallet_id:   Optional[int] = None
+    category:    Optional[str] = None
+    description: Optional[str] = None
+    amount:      Optional[int] = None
+    type:        Optional[str] = None
+
+@router.patch("/transactions/{tx_id}", response_model=TransactionOut)
+def patch_transaction(tx_id: int, data: TransactionPatch, db: Session = Depends(get_db)):
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction introuvable")
+
+    old_wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).first()
+    # Annuler l'effet de l'ancienne transaction sur le solde
+    if old_wallet:
+        if tx.type == "income":  old_wallet.balance -= tx.amount
+        else:                    old_wallet.balance += tx.amount
+
+    new_wallet_id = data.wallet_id if data.wallet_id is not None else tx.wallet_id
+    new_amount    = data.amount    if data.amount    is not None else tx.amount
+    new_type      = data.type      if data.type      is not None else tx.type
+
+    new_wallet = db.query(Wallet).filter(Wallet.id == new_wallet_id).first()
+    if not new_wallet:
+        raise HTTPException(status_code=404, detail="Nouveau portefeuille introuvable")
+
+    # Appliquer le nouvel effet sur le solde
+    if new_type == "income": new_wallet.balance += new_amount
+    else:                    new_wallet.balance -= new_amount
+
+    tx.wallet_id = new_wallet_id
+    tx.amount    = new_amount
+    tx.type      = new_type
+    if data.category    is not None: tx.category    = data.category
+    if data.description is not None: tx.description = data.description
+
+    db.commit()
+    db.refresh(tx)
+    out = TransactionOut.model_validate(tx)
+    out.wallet_name = new_wallet.name
+    return out
+
+
 @router.post("/transactions", response_model=TransactionOut)
 def add_transaction(data: TransactionCreate, db: Session = Depends(get_db)):
     wallet = db.query(Wallet).filter(Wallet.id == data.wallet_id).first()
@@ -1011,12 +1055,14 @@ Pour les conseils : sois spécifique, pas "économise davantage" mais "réduis a
 RÈGLES DE WALLET — PRIORITÉ ABSOLUE (appliquer AVANT toute autre inférence) :
 1. WALLET PAR DÉFAUT : si l'utilisateur ne précise pas de wallet, toujours utiliser "Argent liquide".
    Exemples : "j'ai dépensé 5000", "achat de riz 3000", "taxi 2000" → wallet = Argent liquide.
-2. CRÉDIT YAS / OPÉRATEUR YAS : "crédit Yas", "recharge Yas", "forfait Yas" → wallet = "Mvola" par défaut.
+2. ALIMENTATION / NOURRITURE : TOUTES les dépenses de nourriture (repas, restaurant, courses, épicerie, riz, marché, déjeuner, dîner, petit-déjeuner, cuisine…) → wallet = "Argent liquide" OBLIGATOIREMENT.
+   JAMAIS depuis Compte bancaire, Mvola ou Orange Money pour l'alimentation, SAUF si l'utilisateur précise explicitement un autre wallet.
+3. CRÉDIT YAS / OPÉRATEUR YAS : "crédit Yas", "recharge Yas", "forfait Yas" → wallet = "Mvola" par défaut.
    SAUF si l'utilisateur précise une autre origine (ex: "en liquide", "cash", "avec mon compte") → utiliser le wallet précisé.
-3. CONNEXION ORANGE / INTERNET ORANGE : "paiement connexion Orange", "internet Orange", "forfait Orange", "pass Internet Orange" → wallet = "Orange Money".
-4. TRANSFERTS CASH / MOBILE MONEY → LIQUIDE : "j'ai retiré de l'Orange Money", "retrait Mvola", "transfert banque en liquide"
+4. CONNEXION ORANGE / INTERNET ORANGE : "paiement connexion Orange", "internet Orange", "forfait Orange", "pass Internet Orange" → wallet = "Orange Money".
+5. TRANSFERTS CASH / MOBILE MONEY → LIQUIDE : "j'ai retiré de l'Orange Money", "retrait Mvola", "transfert banque en liquide"
    → utiliser l'action "transfer" avec to_wallet = "Argent liquide".
-5. FRAIS MVOLA : les frais de retrait ou de service Mvola → expense depuis "Mvola", catégorie "mvola".
+6. FRAIS MVOLA : les frais de retrait ou de service Mvola → expense depuis "Mvola", catégorie "mvola".
 
 PROFIL FINANCIER (RÈGLES ABSOLUES — NE JAMAIS DÉROGER) :
 Salaire : {fmt_n(monthly_salary)} Ar/mois
@@ -1040,7 +1086,7 @@ DONNÉES FINANCIÈRES ACTUELLES :{savings_wallet_line}
 
 Réponds UNIQUEMENT avec un JSON valide (sans markdown) :
 {{
-  "action": "add_transaction" | "add_multiple_transactions" | "transfer" | "add_fixed_charge" | "add_provisional_expense" | "update_provisional_expense" | "delete_provisional_expense" | "create_wallet" | "update_settings" | "generate_devis" | "generate_invoice" | "generate_excel" | "generate_report" | "answer",
+  "action": "add_transaction" | "patch_transaction" | "add_multiple_transactions" | "transfer" | "add_fixed_charge" | "add_provisional_expense" | "update_provisional_expense" | "delete_provisional_expense" | "create_wallet" | "update_settings" | "generate_devis" | "generate_invoice" | "generate_excel" | "generate_report" | "answer",
   "message": "Réponse avec \\n\\n entre paragraphes",
   "requires_confirmation": true | false,
   "data": {{ ... }} | null
@@ -1052,6 +1098,12 @@ RÈGLES D'ACTION — CHOISIS LA BONNE :
   Ex: "vire 1M vers mon épargne", "j'ai épargné 1.000.000 ce mois", "transfert de 500k de MVola vers Banque", "j'ai transféré 20k de Mvola vers banque avec 500 de frais"
   data = {{ "from_wallet_id": int, "to_wallet_id": int, "amount": int, "fee": int (0 si non précisé), "description": str }}
   requires_confirmation = true si wallet source ou montant incertains, sinon false
+
+▶ patch_transaction → corriger une transaction existante (mauvais wallet, mauvais montant, mauvaise catégorie)
+  Ex: "corrige la dernière dépense", "change le wallet de cette transaction", "c'était sur Mvola pas sur cash"
+  data = {{ "id": int, "wallet_id": int (optionnel), "amount": int (optionnel), "category": str (optionnel), "description": str (optionnel), "type": str (optionnel) }}
+  requires_confirmation = true
+  IMPORTANT : utilise l'id de la transaction visible dans les dernières transactions ci-dessus
 
 ▶ add_transaction → dépense ou revenu DÉJÀ effectué (passé ou présent immédiat)
   Ex: "j'ai dépensé 5000", "j'ai reçu ma paie", "achat de ce matin"
@@ -1134,6 +1186,11 @@ Commence directement par {{ et termine par }}. Aucun markdown, aucune explicatio
         parsed = call_llm_json(messages, max_tokens=2048, temperature=0.2)
 
         action = parsed.get("action", "answer")
+
+        # ── patch_transaction : toujours via confirmation frontend ────
+        if action == "patch_transaction":
+            parsed["confirm_endpoint"] = "/finance/transactions/" + str((parsed.get("data") or {}).get("id", 0))
+            parsed["confirm_method"]   = "PATCH"
 
         # ── Exécuter directement si pas de confirmation requise ──────
         if not parsed.get("requires_confirmation", True) and action in ("add_transaction", "create_wallet"):
@@ -1252,6 +1309,22 @@ Commence directement par {{ et termine par }}. Aucun markdown, aucune explicatio
             parsed["filename"] = filename
             parsed["requires_confirmation"] = False
 
+        # ── Auto-log ─────────────────────────────────────────────────
+        try:
+            from app.models.action_log import ActionLog
+            _result = "pending_confirm" if parsed.get("requires_confirmation") else "auto"
+            _log = ActionLog(
+                prompt=data.message,
+                ai_response=parsed.get("message", ""),
+                action_type=parsed.get("action", "answer"),
+                action_data=json.dumps(parsed.get("data")) if parsed.get("data") else None,
+                result=_result,
+            )
+            db.add(_log)
+            db.commit()
+        except Exception:
+            pass
+
         return parsed
 
     except json.JSONDecodeError:
@@ -1263,6 +1336,123 @@ Commence directement par {{ et termine par }}. Aucun markdown, aucune explicatio
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur LLM : {str(e)}")
+
+
+# ─── Action Logs ──────────────────────────────────────────────────────
+class ActionLogCreate(BaseModel):
+    prompt:      Optional[str] = None
+    ai_response: Optional[str] = None
+    action_type: Optional[str] = None
+    action_data: Optional[str] = None
+    result:      Optional[str] = None
+
+@router.get("/action-logs/export/csv")
+def export_action_logs_csv(db: Session = Depends(get_db)):
+    import csv as _csv
+    from app.models.action_log import ActionLog
+    logs = db.query(ActionLog).order_by(ActionLog.timestamp.desc()).all()
+    buf = io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["id", "timestamp", "action_type", "result", "prompt", "ai_response", "action_data"])
+    for l in logs:
+        writer.writerow([
+            l.id,
+            l.timestamp.isoformat() if l.timestamp else "",
+            l.action_type or "",
+            l.result or "",
+            (l.prompt or "").replace("\n", " "),
+            (l.ai_response or "").replace("\n", " "),
+            l.action_data or "",
+        ])
+    buf.seek(0)
+    filename = f"historique_actions_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue().encode("utf-8-sig")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+@router.get("/action-logs/export/pdf")
+def export_action_logs_pdf(db: Session = Depends(get_db)):
+    from app.models.action_log import ActionLog
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+
+    logs = db.query(ActionLog).order_by(ActionLog.timestamp.desc()).limit(200).all()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
+    styles = getSampleStyleSheet()
+    cell_s = ParagraphStyle("cell", parent=styles["Normal"], fontSize=7, leading=9)
+    story  = []
+    story.append(Paragraph("Historique des actions", ParagraphStyle("h1", parent=styles["Heading1"], fontSize=16, spaceAfter=8)))
+    story.append(Paragraph(f"Exporté le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 10))
+
+    rows = [["Date", "Action", "Résultat", "Prompt", "Réponse IA"]]
+    for l in logs:
+        ts = l.timestamp.strftime("%d/%m %H:%M") if l.timestamp else ""
+        rows.append([
+            Paragraph(ts, cell_s),
+            Paragraph(l.action_type or "-", cell_s),
+            Paragraph(l.result or "-", cell_s),
+            Paragraph((l.prompt or "")[:250], cell_s),
+            Paragraph((l.ai_response or "")[:250], cell_s),
+        ])
+    tbl = Table(rows, colWidths=[22*mm, 25*mm, 18*mm, 62*mm, 62*mm])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#1e1e2e")),
+        ("TEXTCOLOR",    (0,0), (-1,0), colors.white),
+        ("FONTNAME",     (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",     (0,0), (-1,0), 8),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#f5f5f8")]),
+        ("GRID",         (0,0), (-1,-1), 0.25, colors.HexColor("#cccccc")),
+        ("VALIGN",       (0,0), (-1,-1), "TOP"),
+        ("TOPPADDING",   (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 3),
+    ]))
+    story.append(tbl)
+    doc.build(story)
+    buf.seek(0)
+    filename = f"historique_actions_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+    return StreamingResponse(buf, media_type="application/pdf",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+@router.get("/action-logs")
+def get_action_logs(limit: int = 200, db: Session = Depends(get_db)):
+    from app.models.action_log import ActionLog
+    logs = db.query(ActionLog).order_by(ActionLog.timestamp.desc()).limit(limit).all()
+    return [
+        {
+            "id":          l.id,
+            "timestamp":   l.timestamp.isoformat() if l.timestamp else None,
+            "prompt":      l.prompt,
+            "ai_response": l.ai_response,
+            "action_type": l.action_type,
+            "action_data": l.action_data,
+            "result":      l.result,
+        }
+        for l in logs
+    ]
+
+@router.post("/action-logs")
+def create_action_log(data: ActionLogCreate, db: Session = Depends(get_db)):
+    from app.models.action_log import ActionLog
+    log = ActionLog(
+        prompt=data.prompt,
+        ai_response=data.ai_response,
+        action_type=data.action_type,
+        action_data=data.action_data,
+        result=data.result,
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return {"id": log.id}
 
 
 # ─── Generate Invoice PDF ─────────────────────────────────────────
@@ -1694,6 +1884,7 @@ Portefeuilles disponibles :
 
 RÈGLES DE WALLET (priorité absolue) :
 - Si aucun wallet mentionné → utiliser "Argent liquide" (wallet par défaut)
+- ALIMENTATION / NOURRITURE : repas, courses, épicerie, riz, restaurant, marché → wallet = "Argent liquide" TOUJOURS
 - "crédit Yas", "recharge Yas", "forfait Yas" → wallet = "Mvola" par défaut, SAUF si l'utilisateur précise l'origine (ex: "en liquide", "cash" → Argent liquide)
 - "connexion Orange", "internet Orange", "forfait Orange" → wallet = "Orange Money"
 - "retrait Mvola", "retrait Orange Money" → ce sont des transferts (transfer), pas des expenses

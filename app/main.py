@@ -10,6 +10,7 @@ from app.models import wallet, transaction  # noqa: F401 â€” enregistre les modÃ
 from app.models import fixed_charge, provisional_expense  # noqa: F401
 from app.models import user_settings as _user_settings_model  # noqa: F401
 from app.models import category_budget as _category_budget_model  # noqa: F401
+from app.models import action_log as _action_log_model  # noqa: F401
 from app.routers.finance import router as finance_router
 from app.seed import seed
 from app.ws_manager import manager
