@@ -1023,8 +1023,12 @@ def chat(data: ChatRequest, db: Session = Depends(get_db)):
     monthly_salary       = settings.get("monthly_salary", 2_500_000)
     monthly_savings_goal = settings.get("monthly_savings_goal", 1_000_000)
     savings_wid          = settings.get("savings_wallet_id", 0)
+    current_savings_bal  = settings.get("current_savings_balance", 0)
     savings_w            = db.query(Wallet).filter(Wallet.id == savings_wid).first() if savings_wid else None
-    savings_wallet_line  = f"\nWallet épargne désigné : id={savings_w.id}, nom=\"{savings_w.name}\", solde actuel={savings_w.balance:,} Ar" if savings_w else "\nWallet épargne : non configuré"
+    if savings_w:
+        savings_wallet_line = f"\nWallet épargne désigné : id={savings_w.id}, nom=\"{savings_w.name}\", solde actuel={savings_w.balance:,} Ar"
+    else:
+        savings_wallet_line = f"\nÉpargne virtuelle (dans le compte courant) : solde actuel = {current_savings_bal:,} Ar (current_savings_balance)"
     fmt_n = lambda n: f"{n:,}".replace(",", " ")
 
     # Épargne effective ce mois (exceptionnelle si définie pour ce mois, sinon défaut)
@@ -1153,15 +1157,24 @@ RÈGLES D'ACTION — CHOISIS LA BONNE :
   data = {{ "name": str, "amount": int, "wallet_id": int, "category": str, "day_of_month": int }}
   requires_confirmation = true
 
-▶ update_settings → modifier salaire, objectif épargne, ou épargne exceptionnelle ce mois
-  Ex: "ce mois j'épargne 1.2M", "mon salaire est maintenant 3M", "augmente mon objectif d'épargne à 1.2M"
+▶ update_settings → modifier salaire, objectif épargne, solde épargne actuel, ou épargne exceptionnelle future
   data = {{
     "monthly_salary": int (optionnel),
     "monthly_savings_goal": int (optionnel),
-    "exceptional_savings_amount": int (optionnel — montant exceptionnel CE mois uniquement),
-    "exceptional_savings_month": int (optionnel — YYYYMM, ex: {this_month_int}, toujours fournir si exceptional_savings_amount fourni)
+    "current_savings_balance": int (optionnel — solde épargne ACTUEL, à utiliser quand l'utilisateur veut ajouter/mettre à jour l'épargne immédiatement),
+    "exceptional_savings_amount": int (optionnel — override du montant épargné à la PROCHAINE réception de paie CE mois uniquement),
+    "exceptional_savings_month": int (optionnel — YYYYMM, ex: {this_month_int}, TOUJOURS fournir si exceptional_savings_amount fourni)
   }}
   requires_confirmation = true
+
+  ⚠ DISTINCTION CRITIQUE :
+  • "ajoute X à mon épargne", "j'ai épargné X", "met l'épargne à X", "ajoute l'épargne exceptionnelle avec notre épargne"
+    → current_savings_balance = (solde actuel + X) ou valeur absolue demandée
+    → NE PAS utiliser exceptional_savings_amount pour ça
+  • "ce mois l'épargne exceptionnelle est X", "j'épargne X à la prochaine paie", "override épargne ce mois"
+    → exceptional_savings_amount = X (s'appliquera à la prochaine paie reçue ce mois)
+  Ex: "ajoute 500k à l'épargne" → current_savings_balance = solde_actuel_epargne + 500000
+  Ex: "ce mois j'épargne 1.2M sur ma prochaine paie" → exceptional_savings_amount = 1200000, exceptional_savings_month = {this_month_int}
 
 ▶ create_wallet : data = {{ "name": str, "type": "bank"|"mobile_money"|"cash", "balance": int }}
 
@@ -1224,6 +1237,33 @@ Commence directement par {{ et termine par }}. Aucun markdown, aucune explicatio
                         charge = db.query(FixedCharge).filter(FixedCharge.id == fc_id).first()
                         if charge:
                             tx.description = f"[Auto] {charge.name}"
+
+                    # ── Auto-épargne sur réception de salaire ──────────
+                    if d["type"] == "income" and d.get("category") == "salaire":
+                        s = _get_settings(db)
+                        now_s = datetime.now(timezone.utc)
+                        exc_amount    = s.get("exceptional_savings_amount", 0)
+                        exc_month_int = s.get("exceptional_savings_month", 0)
+                        this_month_int = int(now_s.strftime("%Y%m"))
+                        eff_savings = exc_amount if (exc_month_int == this_month_int and exc_amount > 0) \
+                                      else s.get("monthly_savings_goal", 1_000_000)
+                        savings_wid = s.get("savings_wallet_id", 0)
+                        if savings_wid and savings_wid != d["wallet_id"]:
+                            savings_wallet = db.query(Wallet).filter(Wallet.id == savings_wid).first()
+                            if savings_wallet and wallet.balance >= eff_savings:
+                                wallet.balance -= eff_savings
+                                savings_wallet.balance += eff_savings
+                                db.add(Transaction(type="expense", amount=eff_savings, category="épargne",
+                                    description="[Auto] Épargne mensuelle", wallet_id=wallet.id, date=now_s))
+                                db.add(Transaction(type="income", amount=eff_savings, category="épargne",
+                                    description="[Auto] Épargne mensuelle", wallet_id=savings_wallet.id, date=now_s))
+                        else:
+                            cur = s.get("current_savings_balance", 0)
+                            row = db.query(UserSetting).filter(UserSetting.key == "current_savings_balance").first()
+                            if row:
+                                row.value = cur + eff_savings
+                            else:
+                                db.add(UserSetting(key="current_savings_balance", value=cur + eff_savings))
 
                     db.commit()
             elif action == "create_wallet" and d:
