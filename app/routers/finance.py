@@ -29,6 +29,10 @@ from app.schemas.fixed_charge import FixedChargeCreate, FixedChargeOut
 from app.schemas.provisional_expense import ProvisionalExpenseCreate, ProvisionalExpenseOut
 from app.schemas.category_budget import CategoryBudgetCreate, CategoryBudgetPatch, CategoryBudgetOut
 from app.models.category_budget import CategoryBudget
+from app.models.occupation_type import OccupationType
+from app.models.agenda_event import AgendaEvent
+from app.schemas.occupation_type import OccupationTypeCreate, OccupationTypePatch, OccupationTypeOut
+from app.schemas.agenda_event import AgendaEventCreate, AgendaEventPatch, AgendaEventOut
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
@@ -794,6 +798,35 @@ def pending_payments(db: Session = Depends(get_db)):
     return {"items": unpaid}
 
 
+class PayProvisionalRequest(BaseModel):
+    wallet_id: int
+
+@router.post("/provisional-expenses/{item_id}/pay")
+def pay_provisional_expense(item_id: int, data: PayProvisionalRequest, db: Session = Depends(get_db)):
+    item = db.query(ProvisionalExpense).filter(ProvisionalExpense.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Dépense prévisionnelle introuvable")
+    wallet = db.query(Wallet).filter(Wallet.id == data.wallet_id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Portefeuille introuvable")
+    if wallet.balance < item.amount:
+        raise HTTPException(status_code=400, detail="Solde insuffisant")
+    wallet.balance -= item.amount
+    tx = Transaction(
+        type="expense",
+        amount=item.amount,
+        category=item.category or "previsionnel",
+        description=f"[Prévu] {item.description}",
+        wallet_id=data.wallet_id,
+        date=datetime.now(timezone.utc),
+    )
+    db.add(tx)
+    db.delete(item)
+    db.commit()
+    db.refresh(tx)
+    return {"ok": True, "transaction_id": tx.id, "wallet_balance": wallet.balance}
+
+
 @router.delete("/provisional-expenses/{item_id}")
 def delete_provisional_expense(item_id: int, db: Session = Depends(get_db)):
     item = db.query(ProvisionalExpense).filter(ProvisionalExpense.id == item_id).first()
@@ -952,6 +985,100 @@ def apply_fixed_charges(db: Session = Depends(get_db)):
     }
 
 
+# ─── Occupation Types ──────────────────────────────────────────────
+import json as _json
+
+def _occ_to_out(o: OccupationType) -> dict:
+    return {
+        "id": o.id, "name": o.name, "color": o.color,
+        "collaborators": _json.loads(o.collaborators) if o.collaborators else [],
+    }
+
+@router.get("/occupations", response_model=List[OccupationTypeOut])
+def list_occupations(db: Session = Depends(get_db)):
+    return [_occ_to_out(o) for o in db.query(OccupationType).all()]
+
+@router.post("/occupations", response_model=OccupationTypeOut)
+def create_occupation(data: OccupationTypeCreate, db: Session = Depends(get_db)):
+    o = OccupationType(name=data.name, color=data.color, collaborators=_json.dumps(data.collaborators))
+    db.add(o); db.commit(); db.refresh(o)
+    return _occ_to_out(o)
+
+@router.patch("/occupations/{occ_id}", response_model=OccupationTypeOut)
+def patch_occupation(occ_id: int, data: OccupationTypePatch, db: Session = Depends(get_db)):
+    o = db.query(OccupationType).filter(OccupationType.id == occ_id).first()
+    if not o: raise HTTPException(404, "Occupation not found")
+    if data.name is not None: o.name = data.name
+    if data.color is not None: o.color = data.color
+    if data.collaborators is not None: o.collaborators = _json.dumps(data.collaborators)
+    db.commit(); db.refresh(o)
+    return _occ_to_out(o)
+
+@router.delete("/occupations/{occ_id}")
+def delete_occupation(occ_id: int, db: Session = Depends(get_db)):
+    o = db.query(OccupationType).filter(OccupationType.id == occ_id).first()
+    if not o: raise HTTPException(404, "Occupation not found")
+    db.delete(o); db.commit()
+    return {"deleted": True}
+
+
+# ─── Agenda Events ────────────────────────────────────────────────
+def _evt_to_out(e: AgendaEvent) -> dict:
+    return {
+        "id": e.id, "date": e.date, "hour": e.hour, "duration": e.duration,
+        "title": e.title, "color": e.color,
+        "occupation_id": e.occupation_id,
+        "location": e.location,
+        "participants": _json.loads(e.participants) if e.participants else [],
+        "notes": e.notes,
+    }
+
+@router.get("/events", response_model=List[AgendaEventOut])
+def list_events(month: Optional[str] = None, occupation_id: Optional[int] = None, db: Session = Depends(get_db)):
+    q = db.query(AgendaEvent)
+    if month:
+        q = q.filter(AgendaEvent.date.like(f"{month}%"))
+    if occupation_id:
+        q = q.filter(AgendaEvent.occupation_id == occupation_id)
+    return [_evt_to_out(e) for e in q.order_by(AgendaEvent.date.asc(), AgendaEvent.hour.asc()).all()]
+
+@router.post("/events", response_model=AgendaEventOut)
+def create_event(data: AgendaEventCreate, db: Session = Depends(get_db)):
+    occ = db.query(OccupationType).filter(OccupationType.id == data.occupation_id).first() if data.occupation_id else None
+    color = data.color if data.color != "#60a5fa" else (occ.color if occ else data.color)
+    e = AgendaEvent(
+        date=data.date, hour=data.hour, duration=data.duration,
+        title=data.title, color=color,
+        occupation_id=data.occupation_id, location=data.location,
+        participants=_json.dumps(data.participants), notes=data.notes,
+    )
+    db.add(e); db.commit(); db.refresh(e)
+    return _evt_to_out(e)
+
+@router.patch("/events/{event_id}", response_model=AgendaEventOut)
+def patch_event(event_id: int, data: AgendaEventPatch, db: Session = Depends(get_db)):
+    e = db.query(AgendaEvent).filter(AgendaEvent.id == event_id).first()
+    if not e: raise HTTPException(404, "Event not found")
+    if data.date is not None: e.date = data.date
+    if data.hour is not None: e.hour = data.hour
+    if data.duration is not None: e.duration = data.duration
+    if data.title is not None: e.title = data.title
+    if data.color is not None: e.color = data.color
+    if data.occupation_id is not None: e.occupation_id = data.occupation_id
+    if data.location is not None: e.location = data.location
+    if data.participants is not None: e.participants = _json.dumps(data.participants)
+    if data.notes is not None: e.notes = data.notes
+    db.commit(); db.refresh(e)
+    return _evt_to_out(e)
+
+@router.delete("/events/{event_id}")
+def delete_event(event_id: int, db: Session = Depends(get_db)):
+    e = db.query(AgendaEvent).filter(AgendaEvent.id == event_id).first()
+    if not e: raise HTTPException(404, "Event not found")
+    db.delete(e); db.commit()
+    return {"deleted": True}
+
+
 # ─── Chat LLM ─────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
@@ -1017,6 +1144,40 @@ def chat(data: ChatRequest, db: Session = Depends(get_db)):
         for b in cat_budgets
     )
     cat_context = f"\nBudgets catégorie (dépenses suivies automatiquement par catégorie) :\n{cat_budget_lines}" if cat_budget_lines else ""
+
+    # ── Contexte agenda ──────────────────────────────────────────────
+    occ_types = db.query(OccupationType).all()
+    occ_lines = "\n".join(
+        f'- id={o.id}, nom="{o.name}", couleur={o.color}, collaborateurs={o.collaborators}'
+        for o in occ_types
+    )
+    occ_context = f"\nTypes d'occupation :\n{occ_lines}" if occ_lines else "\nTypes d'occupation : aucun"
+
+    today_str_agenda = now_ctx.strftime("%Y-%m-%d")
+    upcoming_events = (
+        db.query(AgendaEvent)
+        .filter(AgendaEvent.date >= today_str_agenda)
+        .order_by(AgendaEvent.date.asc(), AgendaEvent.hour.asc())
+        .limit(15)
+        .all()
+    )
+    recent_events = (
+        db.query(AgendaEvent)
+        .filter(AgendaEvent.date < today_str_agenda)
+        .order_by(AgendaEvent.date.desc(), AgendaEvent.hour.desc())
+        .limit(5)
+        .all()
+    )
+    all_agenda_events = list(reversed(recent_events)) + upcoming_events
+    agenda_lines = "\n".join(
+        f'- id={e.id}, date={e.date}, heure={e.hour}, durée={e.duration}h, titre="{e.title}"'
+        f', occupation_id={e.occupation_id}'
+        f'{(", lieu=" + e.location) if e.location else ""}'
+        f'{(", participants=" + e.participants) if e.participants and e.participants != "[]" else ""}'
+        f'{(", notes=" + repr(e.notes)) if e.notes else ""}'
+        for e in all_agenda_events
+    )
+    agenda_context = f"\nÉvénements agenda (récents + à venir) :\n{agenda_lines}" if agenda_lines else "\nAgenda : aucun événement"
 
     # Profil utilisateur + budget réel
     settings = _get_settings(db)
@@ -1088,9 +1249,14 @@ DONNÉES FINANCIÈRES ACTUELLES :{savings_wallet_line}
 {cat_context}
 {tx_context}
 
+DONNÉES AGENDA :
+{occ_context}
+{agenda_context}
+Date du jour : {today_str_agenda}
+
 Réponds UNIQUEMENT avec un JSON valide (sans markdown) :
 {{
-  "action": "add_transaction" | "patch_transaction" | "add_multiple_transactions" | "transfer" | "add_fixed_charge" | "add_provisional_expense" | "update_provisional_expense" | "delete_provisional_expense" | "create_wallet" | "update_settings" | "generate_devis" | "generate_invoice" | "generate_excel" | "generate_report" | "answer",
+  "action": "add_transaction" | "patch_transaction" | "add_multiple_transactions" | "transfer" | "add_fixed_charge" | "add_provisional_expense" | "update_provisional_expense" | "delete_provisional_expense" | "create_wallet" | "update_settings" | "generate_devis" | "generate_invoice" | "generate_excel" | "generate_report" | "add_event" | "update_event" | "delete_event" | "add_occupation" | "update_occupation" | "delete_occupation" | "answer",
   "message": "Réponse avec \\n\\n entre paragraphes",
   "requires_confirmation": true | false,
   "data": {{ ... }} | null
@@ -1184,6 +1350,44 @@ RÈGLES D'ACTION — CHOISIS LA BONNE :
 ▶ generate_report : Rapport PDF. data = {{ "type": "transactions"|"monthly"|"full", "months": int, "title": str }}
 
 ▶ answer : Questions, analyses, conseils. Expert, chiffré, direct.
+
+── ACTIONS AGENDA ──────────────────────────────────────────────────
+
+▶ add_event → ajouter un événement à l'agenda
+  Ex: "réunion demain à 9h", "ajoute une formation vendredi 14h-16h", "rdv client lundi 10h salle A"
+  data = {{ "date": "YYYY-MM-DD", "hour": float (ex: 9.5 = 9h30), "duration": float (heures), "title": str, "occupation_id": int|null, "location": str|null, "participants": [str]|[], "notes": str|null }}
+  RÈGLES :
+  - Déduis la date à partir de la date du jour ({today_str_agenda}). "demain" = jour+1, "lundi" = prochain lundi, etc.
+  - Si l'utilisateur précise un type d'occupation connu (Hello Soins, RH, perso, enseignement...) → utilise l'occupation_id correspondant
+  - Si l'utilisateur précise des participants → les ajouter. Sinon, laisser vide.
+  - La couleur est automatiquement déduite de l'occupation, pas besoin de la préciser dans data.
+  requires_confirmation = false si les infos sont claires
+
+▶ update_event → modifier un événement existant
+  Ex: "décale la réunion à 10h", "change le titre de l'événement de demain", "ajoute une note à la réunion"
+  data = {{ "id": int, "date": str|null, "hour": float|null, "duration": float|null, "title": str|null, "occupation_id": int|null, "location": str|null, "participants": [str]|null, "notes": str|null }}
+  requires_confirmation = true
+  Utilise l'id visible dans les événements agenda ci-dessus.
+
+▶ delete_event → supprimer un événement de l'agenda
+  Ex: "annule la réunion de demain", "supprime l'événement X"
+  data = {{ "id": int }}
+  requires_confirmation = true
+
+▶ add_occupation → ajouter un type d'occupation
+  Ex: "ajoute un type d'occupation Freelance", "crée une catégorie Consulting"
+  data = {{ "name": str, "color": str (hex), "collaborators": [str] }}
+  requires_confirmation = false
+
+▶ update_occupation → modifier un type d'occupation (nom, couleur, collaborateurs)
+  Ex: "ajoute Marie à Hello Soins", "retire Jo de RH", "change la couleur de Enseignement en rouge"
+  data = {{ "id": int, "name": str|null, "color": str|null, "collaborators": [str]|null }}
+  IMPORTANT pour les collaborateurs : si l'utilisateur dit "ajoute X à Y", renvoie la liste COMPLÈTE (existante + nouveau). Si "retire X de Y", renvoie la liste SANS X.
+  requires_confirmation = false
+
+▶ delete_occupation → supprimer un type d'occupation
+  data = {{ "id": int }}
+  requires_confirmation = true
 
 ⚠ RAPPEL FORMAT — ABSOLUMENT OBLIGATOIRE :
 Ta réponse doit être UNIQUEMENT un objet JSON valide, sans aucun texte avant ni après.
@@ -1348,6 +1552,80 @@ Commence directement par {{ et termine par }}. Aucun markdown, aucune explicatio
             parsed["excel_base64"] = excel_b64
             parsed["filename"] = filename
             parsed["requires_confirmation"] = False
+
+        # ── Agenda actions ───────────────────────────────────────────
+        if action == "add_event" and not parsed.get("requires_confirmation", True):
+            d = parsed.get("data", {}) or {}
+            if d.get("title") and d.get("date"):
+                occ = db.query(OccupationType).filter(OccupationType.id == d.get("occupation_id")).first() if d.get("occupation_id") else None
+                color = occ.color if occ else "#60a5fa"
+                evt = AgendaEvent(
+                    date=d["date"], hour=d.get("hour", 9), duration=d.get("duration", 1),
+                    title=d["title"], color=color,
+                    occupation_id=d.get("occupation_id"),
+                    location=d.get("location"),
+                    participants=_json.dumps(d.get("participants", [])),
+                    notes=d.get("notes"),
+                )
+                db.add(evt); db.commit(); db.refresh(evt)
+                parsed["created_event_id"] = evt.id
+
+        if action == "add_event" and parsed.get("requires_confirmation", True):
+            parsed["confirm_endpoint"] = "/finance/events"
+
+        if action == "update_event":
+            parsed["confirm_endpoint"] = "__update_event__"
+            if not parsed.get("requires_confirmation", True):
+                d = parsed.get("data", {}) or {}
+                evt = db.query(AgendaEvent).filter(AgendaEvent.id == d.get("id")).first()
+                if evt:
+                    if d.get("date") is not None: evt.date = d["date"]
+                    if d.get("hour") is not None: evt.hour = d["hour"]
+                    if d.get("duration") is not None: evt.duration = d["duration"]
+                    if d.get("title") is not None: evt.title = d["title"]
+                    if d.get("occupation_id") is not None:
+                        evt.occupation_id = d["occupation_id"]
+                        occ = db.query(OccupationType).filter(OccupationType.id == d["occupation_id"]).first()
+                        if occ: evt.color = occ.color
+                    if d.get("location") is not None: evt.location = d["location"]
+                    if d.get("participants") is not None: evt.participants = _json.dumps(d["participants"])
+                    if d.get("notes") is not None: evt.notes = d["notes"]
+                    db.commit()
+
+        if action == "delete_event":
+            parsed["confirm_endpoint"] = "__delete_event__"
+            if not parsed.get("requires_confirmation", True):
+                d = parsed.get("data", {}) or {}
+                evt = db.query(AgendaEvent).filter(AgendaEvent.id == d.get("id")).first()
+                if evt:
+                    db.delete(evt); db.commit()
+
+        if action == "add_occupation" and not parsed.get("requires_confirmation", True):
+            d = parsed.get("data", {}) or {}
+            if d.get("name"):
+                occ = OccupationType(
+                    name=d["name"], color=d.get("color", "#60a5fa"),
+                    collaborators=_json.dumps(d.get("collaborators", [])),
+                )
+                db.add(occ); db.commit(); db.refresh(occ)
+                parsed["created_occupation_id"] = occ.id
+
+        if action == "update_occupation" and not parsed.get("requires_confirmation", True):
+            d = parsed.get("data", {}) or {}
+            occ = db.query(OccupationType).filter(OccupationType.id == d.get("id")).first()
+            if occ:
+                if d.get("name") is not None: occ.name = d["name"]
+                if d.get("color") is not None: occ.color = d["color"]
+                if d.get("collaborators") is not None: occ.collaborators = _json.dumps(d["collaborators"])
+                db.commit()
+
+        if action == "delete_occupation":
+            parsed["confirm_endpoint"] = "__delete_occupation__"
+            if not parsed.get("requires_confirmation", True):
+                d = parsed.get("data", {}) or {}
+                occ = db.query(OccupationType).filter(OccupationType.id == d.get("id")).first()
+                if occ:
+                    db.delete(occ); db.commit()
 
         # ── Auto-log ─────────────────────────────────────────────────
         try:

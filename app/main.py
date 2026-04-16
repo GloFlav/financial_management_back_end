@@ -11,6 +11,8 @@ from app.models import fixed_charge, provisional_expense  # noqa: F401
 from app.models import user_settings as _user_settings_model  # noqa: F401
 from app.models import category_budget as _category_budget_model  # noqa: F401
 from app.models import action_log as _action_log_model  # noqa: F401
+from app.models import occupation_type as _occupation_type_model  # noqa: F401
+from app.models import agenda_event as _agenda_event_model  # noqa: F401
 from app.routers.finance import router as finance_router
 from app.seed import seed
 from app.ws_manager import manager
@@ -57,6 +59,25 @@ try:
         _db2.add(_CB(category="alimentation", default_amount=400_000))
         _db2.commit()
     _db2.close()
+except Exception:
+    pass
+
+# Seed occupation types par défaut
+try:
+    from app.database import SessionLocal as _SL3
+    from app.models.occupation_type import OccupationType as _OT
+    import json as _json
+    _db3 = _SL3()
+    if _db3.query(_OT).count() == 0:
+        _defaults_occ = [
+            _OT(name="Projet perso",  color="#60a5fa", collaborators=_json.dumps(["Guil"])),
+            _OT(name="Enseignement",  color="#c084fc", collaborators=_json.dumps([])),
+            _OT(name="Hello Soins",   color="#34d399", collaborators=_json.dumps(["Guil","Flavien","Marie","Jo","Dev1","Dev2","Client X","Partenaire"])),
+            _OT(name="RH Automation", color="#fbbf24", collaborators=_json.dumps(["Guil","Flavien","Marie","Jo"])),
+        ]
+        _db3.add_all(_defaults_occ)
+        _db3.commit()
+    _db3.close()
 except Exception:
     pass
 
